@@ -11,14 +11,13 @@ from datetime import date, timedelta
 import uuid
 
 from app.database import get_db
+from app.deps import ADMIN, OPS, RequestContext, allow
 from app.models import Expense
 from app.schemas.transactions import (
     ExpenseCreate, ExpenseResponse, ExpenseListResponse, ExpenseSummaryResponse,
 )
 
 router = APIRouter(prefix="/api/v1/expenses", tags=["Expenses"])
-
-BUSINESS_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 VALID_CATEGORIES = {
     "fuel", "salary", "rent", "transport", "packaging",
@@ -28,7 +27,7 @@ VALID_PAYMENT_MODES = {"cash", "upi", "bank_transfer"}
 
 
 @router.post("", response_model=ExpenseResponse, status_code=201)
-def create_expense(data: ExpenseCreate, db: Session = Depends(get_db)):
+def create_expense(data: ExpenseCreate, ctx: RequestContext = Depends(allow(*OPS)), db: Session = Depends(get_db)):
     """
     Record a business expense.
 
@@ -48,7 +47,7 @@ def create_expense(data: ExpenseCreate, db: Session = Depends(get_db)):
 
     expense = Expense(
         id=uuid.uuid4(),
-        business_id=BUSINESS_ID,
+        business_id=ctx.business_id,
         category=data.category,
         amount=data.amount,
         expense_date=data.expense_date or date.today(),
@@ -56,6 +55,7 @@ def create_expense(data: ExpenseCreate, db: Session = Depends(get_db)):
         note=data.note,
         receipt_url=data.receipt_url,
         is_recurring=data.is_recurring,
+        created_by=ctx.user_id,
     )
     db.add(expense)
     db.commit()
@@ -70,10 +70,11 @@ def list_expenses(
     date_to: date | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    ctx: RequestContext = Depends(allow(*OPS)),
     db: Session = Depends(get_db),
 ):
     """List expenses with filters. Returns total_amount for the filtered set."""
-    query = db.query(Expense).filter(Expense.business_id == BUSINESS_ID)
+    query = db.query(Expense).filter(Expense.business_id == ctx.business_id)
 
     if category:
         query = query.filter(Expense.category == category)
@@ -87,7 +88,7 @@ def list_expenses(
     # Calculate total amount for the filtered query
     total_amount = db.query(
         sa_func.coalesce(sa_func.sum(Expense.amount), 0)
-    ).filter(Expense.business_id == BUSINESS_ID)
+    ).filter(Expense.business_id == ctx.business_id)
 
     if category:
         total_amount = total_amount.filter(Expense.category == category)
@@ -110,6 +111,7 @@ def list_expenses(
 @router.get("/summary", response_model=ExpenseSummaryResponse)
 def expense_summary(
     days: int = Query(30, ge=1, le=365, description="Number of days to summarize"),
+    ctx: RequestContext = Depends(allow(*OPS)),
     db: Session = Depends(get_db),
 ):
     """
@@ -122,7 +124,7 @@ def expense_summary(
     rows = (
         db.query(Expense.category, sa_func.sum(Expense.amount))
         .filter(
-            Expense.business_id == BUSINESS_ID,
+            Expense.business_id == ctx.business_id,
             Expense.expense_date >= period_start,
             Expense.expense_date <= period_end,
         )
@@ -142,10 +144,10 @@ def expense_summary(
 
 
 @router.get("/{expense_id}", response_model=ExpenseResponse)
-def get_expense(expense_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_expense(expense_id: uuid.UUID, ctx: RequestContext = Depends(allow(*OPS)), db: Session = Depends(get_db)):
     """Get a single expense."""
     expense = db.query(Expense).filter(
-        Expense.id == expense_id, Expense.business_id == BUSINESS_ID
+        Expense.id == expense_id, Expense.business_id == ctx.business_id
     ).first()
     if not expense:
         raise HTTPException(status_code=404, detail="Expense not found")
@@ -153,10 +155,10 @@ def get_expense(expense_id: uuid.UUID, db: Session = Depends(get_db)):
 
 
 @router.delete("/{expense_id}", status_code=204)
-def delete_expense(expense_id: uuid.UUID, db: Session = Depends(get_db)):
+def delete_expense(expense_id: uuid.UUID, ctx: RequestContext = Depends(allow(*ADMIN)), db: Session = Depends(get_db)):
     """Delete an expense entry."""
     expense = db.query(Expense).filter(
-        Expense.id == expense_id, Expense.business_id == BUSINESS_ID
+        Expense.id == expense_id, Expense.business_id == ctx.business_id
     ).first()
     if not expense:
         raise HTTPException(status_code=404, detail="Expense not found")
