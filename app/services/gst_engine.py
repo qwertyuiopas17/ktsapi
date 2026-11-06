@@ -1,10 +1,15 @@
 """
 KTS — GST Calculation Engine
 Configurable rules engine (not hard-coded) for Indian GST computation.
-Supports the post-Sept 2025 reformed rates: 0%, 5%, 18%, 40%.
+Supports the GST 2.0 slabs (0%, 5%, 18%, 40%, effective 22 Sep 2025) plus
+the legacy 12%/28% rates needed for older documents and tobacco.
 """
-from decimal import Decimal, ROUND_HALF_UP
+import json
 from dataclasses import dataclass
+from datetime import date
+from decimal import ROUND_HALF_UP, Decimal
+from functools import lru_cache
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -16,8 +21,11 @@ GST_SLABS = {
     Decimal("0"): "Nil — essentials (fresh produce, milk, bread)",
     Decimal("5"): "Mass consumption — packaged food, sugar, tea, edible oil",
     Decimal("18"): "Standard — electronics, textiles, machinery, services",
-    Decimal("40"): "Luxury/sin — tobacco, aerated drinks, high-end vehicles",
+    Decimal("40"): "Luxury/sin — aerated drinks, high-end vehicles",
     Decimal("3"): "Special — gold, diamonds",
+    Decimal("0.25"): "Special — rough diamonds",
+    Decimal("12"): "Legacy (pre GST 2.0)",
+    Decimal("28"): "Legacy; tobacco and pan masala until the compensation cess ends",
 }
 
 VALID_GST_RATES = set(GST_SLABS.keys())
@@ -42,6 +50,12 @@ class GstBreakdown:
 def _round2(value: Decimal) -> Decimal:
     """Round to 2 decimal places (standard for Indian invoicing)."""
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def round_to_rupee(amount: Decimal) -> tuple[Decimal, Decimal]:
+    """Invoice round-off to the nearest rupee. Returns (rounded_total, round_off)."""
+    rounded = Decimal(amount).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return rounded.quantize(Decimal("0.01")), (rounded - Decimal(amount)).quantize(Decimal("0.01"))
 
 
 def calculate_line_gst(
@@ -143,57 +157,60 @@ def calculate_bill_gst(
 
 
 # ---------------------------------------------------------------------------
-# HSN → GST Rate Lookup (subset — full DB loaded from hsn_codes.json)
+# HSN → GST rate lookup with effective dates (data/hsn_rates.json)
 # ---------------------------------------------------------------------------
 
-# Common HSN codes for distributor products — covers 80%+ of use cases
-HSN_GST_MAP = {
-    # 0% — Nil
-    "0713": Decimal("0"),   # Dried leguminous vegetables (unbranded)
-    "0401": Decimal("0"),   # Fresh milk
-    "0702": Decimal("0"),   # Tomatoes
-    "1006": Decimal("0"),   # Rice (unbranded)
-
-    # 5%
-    "1701": Decimal("5"),   # Sugar
-    "1901": Decimal("5"),   # Food preparations (branded)
-    "0902": Decimal("5"),   # Tea
-    "1515": Decimal("5"),   # Edible oil
-    "1101": Decimal("5"),   # Wheat flour (atta)
-    "1006.30": Decimal("5"), # Rice (branded/packaged)
-    "0713.10": Decimal("5"), # Branded dried peas
-    "2106": Decimal("5"),   # Food preparations NES
-
-    # 18%
-    "7317": Decimal("18"),  # Nails, tacks, staples (steel nails)
-    "3401": Decimal("18"),  # Soap
-    "3402": Decimal("18"),  # Detergents
-    "8414": Decimal("18"),  # Fans, blowers
-    "8418": Decimal("18"),  # Refrigerators
-    "8516": Decimal("18"),  # Electric heaters, irons
-
-    # 40%
-    "2402": Decimal("40"),  # Cigars, cigarettes
-    "2202": Decimal("40"),  # Aerated drinks
-}
+_RATES_FILE = Path(__file__).resolve().parents[2] / "data" / "hsn_rates.json"
 
 
-def lookup_gst_rate(hsn_code: str) -> Decimal | None:
-    """
-    Look up GST rate from HSN code.
-    Returns None if HSN code not found (user must set manually).
-    Checks exact match first, then partial (first 4 digits).
-    """
+@dataclass(frozen=True)
+class HsnRate:
+    hsn_prefix: str
+    rate: Decimal
+    cess_rate: Decimal
+    effective_from: date
+    effective_to: date | None
+    description: str
+    note: str | None = None
+    requires_ca_review: bool = False
+
+    def active_on(self, on: date) -> bool:
+        return self.effective_from <= on and (self.effective_to is None or on <= self.effective_to)
+
+
+@lru_cache(maxsize=1)
+def load_hsn_rates() -> tuple[HsnRate, ...]:
+    raw = json.loads(_RATES_FILE.read_text(encoding="utf-8"))["rates"]
+    return tuple(
+        HsnRate(
+            hsn_prefix=r["hsn_prefix"],
+            rate=Decimal(str(r["rate"])),
+            cess_rate=Decimal(str(r.get("cess_rate") or 0)),
+            effective_from=date.fromisoformat(r["effective_from"]),
+            effective_to=date.fromisoformat(r["effective_to"]) if r.get("effective_to") else None,
+            description=r.get("description", ""),
+            note=r.get("note"),
+            requires_ca_review=bool(r.get("requires_ca_review", False)),
+        )
+        for r in raw
+    )
+
+
+def lookup_hsn(hsn_code: str | None, on_date: date | None = None) -> HsnRate | None:
+    """Longest HSN prefix match that is in force on `on_date` (default: today)."""
     if not hsn_code:
         return None
+    code = hsn_code.replace(".", "").replace(" ", "")
+    on = on_date or date.today()
+    best: HsnRate | None = None
+    for r in load_hsn_rates():
+        if code.startswith(r.hsn_prefix) and r.active_on(on):
+            if best is None or len(r.hsn_prefix) > len(best.hsn_prefix):
+                best = r
+    return best
 
-    # Exact match
-    if hsn_code in HSN_GST_MAP:
-        return HSN_GST_MAP[hsn_code]
 
-    # Try first 4 digits
-    prefix = hsn_code[:4]
-    if prefix in HSN_GST_MAP:
-        return HSN_GST_MAP[prefix]
-
-    return None
+def lookup_gst_rate(hsn_code: str | None, on_date: date | None = None) -> Decimal | None:
+    """GST rate for an HSN code on a date, or None if unknown (user must set it)."""
+    found = lookup_hsn(hsn_code, on_date)
+    return found.rate if found else None

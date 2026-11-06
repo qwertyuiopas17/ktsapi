@@ -1,62 +1,137 @@
 """
 KTS — Inventory Service
-All stock-affecting operations go through here.
-Every mutation is wrapped in a DB transaction and creates an audit trail (inventory_txn).
+All stock-affecting operations go through here. Each one:
+  - locks the inventory row (SELECT ... FOR UPDATE) so concurrent bills cannot oversell,
+  - is scoped to the caller's business,
+  - writes an InventoryTxn audit row with the cost per primary unit.
+
+Costing is moving-average: purchase receipts (and reversals) blend into
+Inventory.avg_cost; outflows are valued at the current avg_cost.
 """
+from __future__ import annotations
+
 from decimal import Decimal
-from sqlalchemy.orm import Session
 from uuid import UUID, uuid4
+
+from sqlalchemy.orm import Session
 
 from app.models import Inventory, InventoryTxn, Product
 
+COST_Q = Decimal("0.0001")
+_COST_BEARING_IN = {"purchase_in", "return_in", "sale_reversal"}
 
-def get_stock(db: Session, product_id: UUID) -> dict:
-    """
-    Get current stock for a product in both units.
-    Returns: {qty_primary, qty_secondary, unit_primary, unit_secondary, value_at_cost}
-    """
-    inv = db.query(Inventory).filter(Inventory.product_id == product_id).first()
-    product = db.query(Product).filter(Product.id == product_id).first()
 
+class InventoryError(ValueError):
+    status_code = 400
+
+
+class InventoryNotFound(InventoryError):
+    status_code = 404
+
+
+class InsufficientStock(InventoryError):
+    status_code = 400
+
+
+def to_primary_qty(product: Product, qty: Decimal, unit: str | None) -> Decimal:
+    """Convert a quantity entered in `unit` into the product's primary (stocking) unit."""
+    qty = Decimal(str(qty))
+    if unit and unit != product.primary_unit and product.conversion_factor:
+        return qty / Decimal(str(product.conversion_factor))
+    return qty
+
+
+def lock_inventories(db: Session, business_id: UUID, product_ids: list[UUID]) -> dict[UUID, Inventory]:
+    """
+    Lock several inventory rows at once, in a stable order, to avoid deadlocks
+    between two bills that contain the same products in a different order.
+    """
+    db.flush()  # populate_existing() below must not discard unflushed changes
+    rows = (
+        db.query(Inventory)
+        .filter(Inventory.business_id == business_id, Inventory.product_id.in_(set(product_ids)))
+        .order_by(Inventory.product_id)
+        .with_for_update()
+        .populate_existing()
+        .all()
+    )
+    return {r.product_id: r for r in rows}
+
+
+def _locked(db: Session, business_id: UUID, product_id: UUID) -> Inventory:
+    db.flush()  # populate_existing() below must not discard unflushed changes
+    inv = (
+        db.query(Inventory)
+        .filter(Inventory.business_id == business_id, Inventory.product_id == product_id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if inv is None:
+        raise InventoryNotFound(f"No inventory record for product {product_id}")
+    return inv
+
+
+def get_stock(db: Session, business_id: UUID, product_id: UUID) -> dict:
+    inv = db.query(Inventory).filter(
+        Inventory.business_id == business_id, Inventory.product_id == product_id
+    ).first()
+    product = db.query(Product).filter(
+        Product.business_id == business_id, Product.id == product_id
+    ).first()
     if not inv or not product:
         return {"qty_primary": Decimal("0"), "qty_secondary": Decimal("0")}
-
-    qty_secondary = inv.qty_primary * product.conversion_factor
-
     return {
         "qty_primary": inv.qty_primary,
-        "qty_secondary": qty_secondary,
+        "qty_secondary": inv.qty_primary * product.conversion_factor,
         "unit_primary": product.primary_unit,
         "unit_secondary": product.secondary_unit,
-        "value_at_cost": inv.qty_primary * product.purchase_price,
+        "avg_cost": inv.avg_cost,
+        "value_at_cost": inv.qty_primary * inv.avg_cost,
     }
 
 
 def stock_in(
     db: Session,
+    business_id: UUID,
     product_id: UUID,
     quantity: Decimal,
     unit: str,
+    *,
+    txn_type: str,
     reference_type: str,
-    reference_id: UUID,
+    reference_id: UUID | None,
+    unit_cost: Decimal | None = None,
     user_id: UUID | None = None,
     note: str | None = None,
 ) -> InventoryTxn:
     """
-    Add stock (from a purchase, return, or adjustment).
-    Quantity should be in PRIMARY unit.
+    Add stock. `quantity` is in the PRIMARY unit; `unit_cost` is ex-GST landed
+    cost per primary unit and is blended into the moving average.
     """
-    inv = db.query(Inventory).filter(Inventory.product_id == product_id).first()
-    if not inv:
-        raise ValueError(f"No inventory record for product {product_id}")
+    if txn_type not in {"purchase_in", "return_in", "sale_reversal", "adjustment", "transfer"}:
+        raise InventoryError(f"Invalid inbound txn_type {txn_type}")
+    quantity = Decimal(str(quantity))
+    inv = _locked(db, business_id, product_id)
 
-    inv.qty_primary += quantity
+    if unit_cost is not None and txn_type in _COST_BEARING_IN and quantity > 0:
+        unit_cost = Decimal(str(unit_cost))
+        on_hand = inv.qty_primary or Decimal("0")
+        if on_hand <= 0:
+            inv.avg_cost = unit_cost.quantize(COST_Q)
+        else:
+            inv.avg_cost = (
+                (on_hand * (inv.avg_cost or 0) + quantity * unit_cost) / (on_hand + quantity)
+            ).quantize(COST_Q)
 
+    inv.qty_primary = (inv.qty_primary or Decimal("0")) + quantity
     txn = InventoryTxn(
         id=uuid4(),
+        business_id=business_id,
         inventory_id=inv.id,
-        txn_type="purchase_in" if reference_type == "purchase" else "return_in",
+        txn_type=txn_type,
         qty_change=quantity,
+        unit_cost=unit_cost if unit_cost is not None else inv.avg_cost,
         unit=unit,
         reference_type=reference_type,
         reference_id=reference_id,
@@ -69,37 +144,33 @@ def stock_in(
 
 def stock_out(
     db: Session,
+    business_id: UUID,
     product_id: UUID,
     quantity: Decimal,
     unit: str,
+    *,
     reference_type: str,
-    reference_id: UUID,
+    reference_id: UUID | None,
+    txn_type: str = "sale_out",
     user_id: UUID | None = None,
     note: str | None = None,
     allow_negative: bool = False,
 ) -> InventoryTxn:
-    """
-    Remove stock (from a sale or transfer).
-    Quantity should be in PRIMARY unit (positive value — will be stored as negative).
-    Raises ValueError if stock would go negative (unless allow_negative=True).
-    """
-    inv = db.query(Inventory).filter(Inventory.product_id == product_id).first()
-    if not inv:
-        raise ValueError(f"No inventory record for product {product_id}")
-
+    """Remove stock (positive `quantity` in the PRIMARY unit), valued at avg_cost."""
+    quantity = Decimal(str(quantity))
+    inv = _locked(db, business_id, product_id)
     if not allow_negative and inv.qty_primary < quantity:
-        raise ValueError(
-            f"Insufficient stock for product {product_id}: "
-            f"available={inv.qty_primary}, requested={quantity}"
+        raise InsufficientStock(
+            f"Insufficient stock for product {product_id}: available={inv.qty_primary}, requested={quantity}"
         )
-
     inv.qty_primary -= quantity
-
     txn = InventoryTxn(
         id=uuid4(),
+        business_id=business_id,
         inventory_id=inv.id,
-        txn_type="sale_out",
-        qty_change=-quantity,  # negative for outflow
+        txn_type=txn_type,
+        qty_change=-quantity,
+        unit_cost=inv.avg_cost,
         unit=unit,
         reference_type=reference_type,
         reference_id=reference_id,
@@ -112,79 +183,56 @@ def stock_out(
 
 def record_wastage(
     db: Session,
+    business_id: UUID,
     product_id: UUID,
     quantity: Decimal,
     unit: str,
+    *,
+    reference_type: str = "wastage",
     reference_id: UUID | None = None,
     user_id: UUID | None = None,
     note: str | None = None,
 ) -> InventoryTxn:
-    """Record wastage/damage — deducts from stock, logs as loss."""
-    inv = db.query(Inventory).filter(Inventory.product_id == product_id).first()
-    if not inv:
-        raise ValueError(f"No inventory record for product {product_id}")
-
-    inv.qty_primary -= quantity
-
-    txn = InventoryTxn(
-        id=uuid4(),
-        inventory_id=inv.id,
-        txn_type="wastage",
-        qty_change=-quantity,
-        unit=unit,
-        reference_type="wastage",
-        reference_id=reference_id,
-        note=note or "Damaged/short on arrival",
-        created_by=user_id,
+    """Write off damaged/short stock at the current average cost."""
+    return stock_out(
+        db, business_id, product_id, quantity, unit,
+        reference_type=reference_type, reference_id=reference_id, txn_type="wastage",
+        user_id=user_id, note=note or "Damaged/short on arrival", allow_negative=True,
     )
-    db.add(txn)
-    return txn
 
 
 def adjust_stock(
     db: Session,
+    business_id: UUID,
     product_id: UUID,
     actual_qty: Decimal,
     reason: str,
+    *,
     user_id: UUID | None = None,
+    note: str | None = None,
+    reference_id: UUID | None = None,
 ) -> InventoryTxn:
-    """
-    Physical count adjustment — sets stock to actual_qty, logs the difference.
-    reason: 'damage', 'theft', 'measurement_error', 'personal_use'
-    """
-    inv = db.query(Inventory).filter(Inventory.product_id == product_id).first()
-    if not inv:
-        raise ValueError(f"No inventory record for product {product_id}")
-
-    product = db.query(Product).filter(Product.id == product_id).first()
+    """Physical count: set stock to `actual_qty` (primary unit) and log the difference."""
+    inv = _locked(db, business_id, product_id)
+    product = db.get(Product, product_id)
+    actual_qty = Decimal(str(actual_qty))
     difference = actual_qty - inv.qty_primary
     inv.qty_primary = actual_qty
-
+    text = f"Physical count adjustment: {reason}"
+    if note:
+        text += f" — {note}"
     txn = InventoryTxn(
         id=uuid4(),
+        business_id=business_id,
         inventory_id=inv.id,
         txn_type="adjustment",
         qty_change=difference,
+        unit_cost=inv.avg_cost,
         unit=product.primary_unit if product else "unit",
         reference_type="stock_count",
-        note=f"Physical count adjustment: {reason}",
+        reference_id=reference_id,
+        note=text,
         created_by=user_id,
     )
     db.add(txn)
     return txn
-
-
-def convert_to_primary_unit(
-    db: Session,
-    product_id: UUID,
-    qty_in_secondary: Decimal,
-) -> Decimal:
-    """
-    Convert a quantity from secondary unit to primary unit.
-    e.g., 12.5 Kg → 0.25 Bags (if conversion_factor = 50)
-    """
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product or not product.conversion_factor:
-        return qty_in_secondary
-
-    return qty_in_secondary / product.conversion_factor
