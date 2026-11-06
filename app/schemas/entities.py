@@ -2,6 +2,8 @@
 KTS — Product, Customer, Company Schemas
 Pydantic models for CRUD + search endpoints.
 """
+from typing import Literal
+
 from pydantic import BaseModel, Field
 from decimal import Decimal
 from datetime import datetime
@@ -33,11 +35,11 @@ class ProductUpdate(BaseModel):
     name: str | None = None
     shortcode: str | None = None
     hsn_code: str | None = None
-    gst_rate: Decimal | None = None
+    gst_rate: Decimal | None = Field(None, ge=0, le=40)
     category: str | None = None
     primary_unit: str | None = None
     secondary_unit: str | None = None
-    conversion_factor: Decimal | None = None
+    conversion_factor: Decimal | None = Field(None, gt=0)
     purchase_price: Decimal | None = None
     sell_price_retail: Decimal | None = None
     sell_price_wholesale: Decimal | None = None
@@ -67,6 +69,7 @@ class ProductResponse(BaseModel):
 
     # Stock info (joined from inventory)
     current_stock: Decimal | None = None
+    avg_cost: Decimal | None = None  # moving-average cost per primary unit
     stock_value: Decimal | None = None
 
     model_config = {"from_attributes": True}
@@ -88,7 +91,7 @@ class CustomerCreate(BaseModel):
     state_code: str | None = Field(None, max_length=2)
     gstin: str | None = Field(None, max_length=15)
     credit_limit: Decimal = Field(default=Decimal("0"), ge=0)
-    price_tier: str = "retail"  # retail, wholesale, special
+    price_tier: Literal["retail", "wholesale", "special"] = "retail"
     beat_day: str | None = None
 
 
@@ -98,8 +101,8 @@ class CustomerUpdate(BaseModel):
     address: str | None = None
     state_code: str | None = None
     gstin: str | None = None
-    credit_limit: Decimal | None = None
-    price_tier: str | None = None
+    credit_limit: Decimal | None = Field(None, ge=0)
+    price_tier: Literal["retail", "wholesale", "special"] | None = None
     beat_day: str | None = None
 
 
@@ -173,4 +176,7 @@ class CompanyListResponse(BaseModel):
 class HsnLookupResponse(BaseModel):
     hsn_code: str
     gst_rate: Decimal | None
+    cess_rate: Decimal | None = None
     description: str | None = None
+    note: str | None = None
+    requires_ca_review: bool = False
