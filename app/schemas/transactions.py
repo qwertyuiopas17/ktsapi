@@ -339,3 +339,4 @@ class ExpenseSummaryResponse(BaseModel):
     period_end: date
     total: Decimal
     by_category: dict[str, Decimal] = {}
+

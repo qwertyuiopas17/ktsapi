@@ -10,15 +10,15 @@ from datetime import date
 import uuid
 
 from app.database import get_db
-from app.models import Purchase, PurchaseItem, Product, Company, Inventory, InventoryTxn, LedgerEntry
+from app.deps import OPS, RequestContext, allow
+from app.models import Company, LedgerEntry, Product, Purchase, PurchaseItem
 from app.schemas.transactions import (
-    PurchaseCreate, PurchaseResponse, PurchaseItemResponse, PurchaseListResponse,
+    PurchaseCreate, PurchaseItemResponse, PurchaseListResponse, PurchaseResponse,
 )
-from app.services.inventory_service import stock_in, record_wastage
+from app.services.inventory_service import lock_inventories, record_wastage, stock_in, to_primary_qty
+from app.utils.scoping import get_owned
 
 router = APIRouter(prefix="/api/v1/purchases", tags=["Purchases"])
-
-BUSINESS_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")  # dev placeholder
 
 
 def _compute_line_item(item_data) -> dict:
@@ -54,11 +54,11 @@ def _compute_line_item(item_data) -> dict:
 
 def _purchase_to_response(purchase: Purchase, db: Session) -> PurchaseResponse:
     """Convert Purchase model to response, joining company name and item product names."""
-    company = db.query(Company).filter(Company.id == purchase.company_id).first()
+    company = db.get(Company, purchase.company_id)
 
     item_responses = []
     for item in purchase.items:
-        product = db.query(Product).filter(Product.id == item.product_id).first()
+        product = db.get(Product, item.product_id)
         item_responses.append(PurchaseItemResponse(
             id=item.id,
             product_id=item.product_id,
@@ -98,51 +98,43 @@ def _purchase_to_response(purchase: Purchase, db: Session) -> PurchaseResponse:
 # ---------------------------------------------------------------------------
 
 @router.post("", response_model=PurchaseResponse, status_code=201)
-def create_purchase(data: PurchaseCreate, db: Session = Depends(get_db)):
+def create_purchase(data: PurchaseCreate, ctx: RequestContext = Depends(allow(*OPS)), db: Session = Depends(get_db)):
     """
-    Create a purchase + update inventory (TRANSACTIONAL).
+    Create a purchase and receive stock in one transaction:
+    1. Validate company and products (within the caller's business)
+    2. Compute line totals (qty × rate − discount + GST)
+    3. Stock in the full quantity at the net landed rate (ex-GST), blending the
+       moving-average cost; then write damaged quantity off as wastage so the
+       loss is visible (and claimable) instead of silently inflating cost
+    4. Update company outstanding + ledger
+    """
+    company = get_owned(db, Company, data.company_id, ctx, detail="Company not found", for_update=True)
 
-    This is the core "front door" operation:
-    1. Validate company and all products exist
-    2. Compute line item totals (qty × rate − discount + GST)
-    3. Create purchase + purchase_items
-    4. For each item: stock_in (good qty) + wastage (damaged qty)
-    5. Update company outstanding (if credit/partial)
-    6. Create ledger entry for company
-    All in a single DB transaction.
-    """
-    # Validate company exists
-    company = db.query(Company).filter(
-        Company.id == data.company_id, Company.business_id == BUSINESS_ID
-    ).first()
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
+    products = {
+        p.id: p
+        for p in db.query(Product).filter(
+            Product.id.in_({i.product_id for i in data.items}), Product.business_id == ctx.business_id
+        )
+    }
+    for item in data.items:
+        if item.product_id not in products:
+            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
+        if item.damaged_qty > item.quantity:
+            raise HTTPException(status_code=400, detail="damaged_qty cannot exceed quantity")
 
     purchase_id = uuid.uuid4()
     total_subtotal = Decimal("0")
     total_gst = Decimal("0")
-
     purchase_items = []
-    stock_ops = []  # deferred stock operations
+    stock_ops = []
 
     for item_data in data.items:
-        # Validate product
-        product = db.query(Product).filter(
-            Product.id == item_data.product_id, Product.business_id == BUSINESS_ID
-        ).first()
-        if not product:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Product {item_data.product_id} not found"
-            )
-
-        # Auto-fill GST from product if not provided
+        product = products[item_data.product_id]
         gst_rate = item_data.gst_rate if item_data.gst_rate > 0 else product.gst_rate
+        item_for_calc = item_data.model_copy(update={"gst_rate": gst_rate})
+        computed = _compute_line_item(item_for_calc)
 
-        # Compute totals
-        computed = _compute_line_item(item_data)
-
-        purchase_item = PurchaseItem(
+        purchase_items.append(PurchaseItem(
             id=uuid.uuid4(),
             purchase_id=purchase_id,
             product_id=product.id,
@@ -155,26 +147,23 @@ def create_purchase(data: PurchaseCreate, db: Session = Depends(get_db)):
             gst_rate=gst_rate,
             gst_amount=computed["gst_amount"],
             total=computed["total"],
-        )
-        purchase_items.append(purchase_item)
-
+        ))
         total_subtotal += computed["subtotal"]
         total_gst += computed["gst_amount"]
 
-        # Prepare stock operations
-        good_qty = item_data.quantity - item_data.damaged_qty
-        if good_qty > 0:
-            stock_ops.append(("in", product.id, good_qty, product.primary_unit, product))
-        if item_data.damaged_qty > 0:
-            stock_ops.append(("wastage", product.id, item_data.damaged_qty, product.primary_unit, product))
+        qty_primary = to_primary_qty(product, item_data.quantity, item_data.unit)
+        damaged_primary = to_primary_qty(product, item_data.damaged_qty, item_data.unit)
+        landed_rate = computed["subtotal"] / qty_primary  # ex-GST cost per primary unit
+        stock_ops.append((product, qty_primary, damaged_primary, landed_rate, item_data.rate))
 
     total_amount = (total_subtotal + total_gst).quantize(Decimal("0.01"))
+    if data.amount_paid > total_amount:
+        raise HTTPException(status_code=400, detail="amount_paid cannot exceed the purchase total")
 
-    # Create purchase record
-    purchase = Purchase(
+    db.add(Purchase(
         id=purchase_id,
-        business_id=BUSINESS_ID,
-        company_id=data.company_id,
+        business_id=ctx.business_id,
+        company_id=company.id,
         invoice_number=data.invoice_number,
         invoice_date=data.invoice_date or date.today(),
         subtotal=total_subtotal,
@@ -184,48 +173,45 @@ def create_purchase(data: PurchaseCreate, db: Session = Depends(get_db)):
         amount_paid=data.amount_paid,
         source=data.source,
         ocr_image_url=data.ocr_image_url,
-    )
-    db.add(purchase)
+        created_by=ctx.user_id,
+    ))
+    db.add_all(purchase_items)
 
-    # Add all items
-    for item in purchase_items:
-        db.add(item)
+    lock_inventories(db, ctx.business_id, list(products))
+    for product, qty_primary, damaged_primary, landed_rate, entered_rate in stock_ops:
+        stock_in(
+            db, ctx.business_id, product.id, qty_primary, product.primary_unit,
+            txn_type="purchase_in", unit_cost=landed_rate,
+            reference_type="purchase", reference_id=purchase_id, user_id=ctx.user_id,
+        )
+        if damaged_primary > 0:
+            record_wastage(
+                db, ctx.business_id, product.id, damaged_primary, product.primary_unit,
+                reference_type="purchase", reference_id=purchase_id, user_id=ctx.user_id,
+            )
+        # Last purchase price is kept for reference; costing uses Inventory.avg_cost
+        product.purchase_price = entered_rate
 
-    # Execute stock operations
-    for op_type, product_id, qty, unit, product in stock_ops:
-        if op_type == "in":
-            stock_in(db, product_id, qty, unit, "purchase", purchase_id)
-            # Update product's latest purchase price from its matching line item
-            matching = [pi for pi in purchase_items if pi.product_id == product_id]
-            if matching:
-                product.purchase_price = matching[0].rate
-        elif op_type == "wastage":
-            record_wastage(db, product_id, qty, unit, reference_id=purchase_id)
-
-    # Update company outstanding (if credit or partial)
     outstanding_increase = total_amount - data.amount_paid
     if outstanding_increase > 0:
         company.outstanding += outstanding_increase
 
-    # Create ledger entry
-    ledger = LedgerEntry(
+    db.add(LedgerEntry(
         id=uuid.uuid4(),
-        business_id=BUSINESS_ID,
+        business_id=ctx.business_id,
         party_type="company",
-        party_id=data.company_id,
+        party_id=company.id,
         entry_type="purchase",
         amount=total_amount,
         running_balance=company.outstanding,
         reference_type="purchase",
         reference_id=purchase_id,
         description=f"Purchase #{data.invoice_number or 'N/A'} from {company.name}",
-    )
-    db.add(ledger)
+    ))
 
-    # Commit everything atomically
     db.commit()
+    purchase = db.get(Purchase, purchase_id)
     db.refresh(purchase)
-
     return _purchase_to_response(purchase, db)
 
 
@@ -237,10 +223,11 @@ def list_purchases(
     date_to: date | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    ctx: RequestContext = Depends(allow(*OPS)),
     db: Session = Depends(get_db),
 ):
     """List purchases with filters."""
-    query = db.query(Purchase).filter(Purchase.business_id == BUSINESS_ID)
+    query = db.query(Purchase).filter(Purchase.business_id == ctx.business_id)
 
     if company_id:
         query = query.filter(Purchase.company_id == company_id)
@@ -261,12 +248,9 @@ def list_purchases(
 
 
 @router.get("/{purchase_id}", response_model=PurchaseResponse)
-def get_purchase(purchase_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_purchase(purchase_id: uuid.UUID, ctx: RequestContext = Depends(allow(*OPS)), db: Session = Depends(get_db)):
     """Get a single purchase with all items and bill image."""
-    purchase = db.query(Purchase).filter(Purchase.id == purchase_id).first()
-    if not purchase:
-        raise HTTPException(status_code=404, detail="Purchase not found")
-    return _purchase_to_response(purchase, db)
+    return _purchase_to_response(get_owned(db, Purchase, purchase_id, ctx, detail="Purchase not found"), db)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +260,7 @@ def get_purchase(purchase_id: uuid.UUID, db: Session = Depends(get_db)):
 @router.post("/scan", tags=["Purchases"])
 async def scan_invoice(
     file: UploadFile = File(..., description="Invoice photo (JPG/PNG) or PDF"),
+    ctx: RequestContext = Depends(allow(*OPS)),
     db: Session = Depends(get_db),
 ):
     """
@@ -326,7 +311,7 @@ async def scan_invoice(
     if result.get("gstin"):
         company = db.query(Company).filter(
             Company.gstin == result["gstin"],
-            Company.business_id == BUSINESS_ID,
+            Company.business_id == ctx.business_id,
         ).first()
         if company:
             matched_company = {"id": str(company.id), "name": company.name}
@@ -334,7 +319,7 @@ async def scan_invoice(
     if not matched_company and result.get("company_name"):
         company = db.query(Company).filter(
             Company.name.ilike(f"%{result['company_name']}%"),
-            Company.business_id == BUSINESS_ID,
+            Company.business_id == ctx.business_id,
         ).first()
         if company:
             matched_company = {"id": str(company.id), "name": company.name}
@@ -345,7 +330,7 @@ async def scan_invoice(
         product_name = item.get("product_name", "")
         product = db.query(Product).filter(
             Product.name.ilike(f"%{product_name}%"),
-            Product.business_id == BUSINESS_ID,
+            Product.business_id == ctx.business_id,
         ).first()
 
         matched_items.append({
