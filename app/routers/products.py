@@ -3,18 +3,20 @@ KTS — Product Router
 Full CRUD for products + HSN lookup + stock info join.
 Products are the master data that feeds everything else.
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
+from datetime import date
 from decimal import Decimal
 import uuid
 
 from app.database import get_db
-from app.models import Product, Inventory
+from app.deps import ADMIN, ALL_ROLES, OPS, RequestContext, allow
+from app.models import Inventory, Product
 from app.schemas.entities import (
-    ProductCreate, ProductUpdate, ProductResponse, ProductListResponse,
-    HsnLookupResponse,
+    HsnLookupResponse, ProductCreate, ProductListResponse, ProductResponse, ProductUpdate,
 )
-from app.services.gst_engine import lookup_gst_rate
+from app.services.gst_engine import lookup_gst_rate, lookup_hsn
+from app.utils.scoping import get_owned
 
 router = APIRouter(prefix="/api/v1/products", tags=["Products"])
 
@@ -25,9 +27,11 @@ router = APIRouter(prefix="/api/v1/products", tags=["Products"])
 
 def _product_to_response(product: Product, db: Session) -> ProductResponse:
     """Convert model to response, joining inventory data."""
-    inv = db.query(Inventory).filter(Inventory.product_id == product.id).first()
+    inv = db.query(Inventory).filter(
+        Inventory.product_id == product.id, Inventory.business_id == product.business_id
+    ).first()
     current_stock = inv.qty_primary if inv else Decimal("0")
-    stock_value = current_stock * product.purchase_price if inv else Decimal("0")
+    avg_cost = inv.avg_cost if inv else Decimal("0")
 
     return ProductResponse(
         id=product.id,
@@ -48,7 +52,8 @@ def _product_to_response(product: Product, db: Session) -> ProductResponse:
         is_active=product.is_active,
         created_at=product.created_at,
         current_stock=current_stock,
-        stock_value=stock_value,
+        avg_cost=avg_cost,
+        stock_value=(current_stock * avg_cost).quantize(Decimal("0.01")),
     )
 
 
@@ -57,11 +62,9 @@ def _product_to_response(product: Product, db: Session) -> ProductResponse:
 # ---------------------------------------------------------------------------
 
 @router.post("", response_model=ProductResponse, status_code=201)
-def create_product(data: ProductCreate, db: Session = Depends(get_db)):
+def create_product(data: ProductCreate, ctx: RequestContext = Depends(allow(*OPS)), db: Session = Depends(get_db)):
     """Create a new product and initialize its inventory record."""
-    # TODO: get business_id from JWT
-    # For now, require it as header
-    business_id = uuid.UUID("00000000-0000-0000-0000-000000000001")  # dev placeholder
+    business_id = ctx.business_id
 
     # Auto-fill GST rate from HSN if provided
     if data.hsn_code and data.gst_rate == 0:
@@ -111,10 +114,11 @@ def list_products(
     is_active: bool = Query(True),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    ctx: RequestContext = Depends(allow(*ALL_ROLES)),
     db: Session = Depends(get_db),
 ):
     """List products with search, filter, and pagination."""
-    business_id = uuid.UUID("00000000-0000-0000-0000-000000000001")  # dev placeholder
+    business_id = ctx.business_id
 
     query = db.query(Product).filter(
         Product.business_id == business_id,
@@ -140,22 +144,27 @@ def list_products(
 
 
 @router.get("/hsn-lookup", response_model=HsnLookupResponse)
-def hsn_lookup(hsn_code: str = Query(..., min_length=4, max_length=8)):
-    """Look up GST rate from HSN code."""
-    rate = lookup_gst_rate(hsn_code)
+def hsn_lookup(
+    hsn_code: str = Query(..., min_length=4, max_length=8),
+    on_date: date | None = Query(None, description="Rate in force on this date (default today)"),
+    ctx: RequestContext = Depends(allow(*ALL_ROLES)),
+):
+    """Look up the GST rate for an HSN code on a date."""
+    found = lookup_hsn(hsn_code, on_date)
     return HsnLookupResponse(
         hsn_code=hsn_code,
-        gst_rate=rate,
-        description=None,  # TODO: add HSN descriptions
+        gst_rate=found.rate if found else None,
+        cess_rate=found.cess_rate if found else None,
+        description=found.description if found else None,
+        note=found.note if found else None,
+        requires_ca_review=found.requires_ca_review if found else False,
     )
 
 
 @router.get("/{product_id}", response_model=ProductResponse)
-def get_product(product_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_product(product_id: uuid.UUID, ctx: RequestContext = Depends(allow(*ALL_ROLES)), db: Session = Depends(get_db)):
     """Get a single product by ID."""
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
+    product = get_owned(db, Product, product_id, ctx, detail="Product not found")
     return _product_to_response(product, db)
 
 
@@ -163,12 +172,11 @@ def get_product(product_id: uuid.UUID, db: Session = Depends(get_db)):
 def update_product(
     product_id: uuid.UUID,
     data: ProductUpdate,
+    ctx: RequestContext = Depends(allow(*OPS)),
     db: Session = Depends(get_db),
 ):
     """Update a product (partial update)."""
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
+    product = get_owned(db, Product, product_id, ctx, detail="Product not found")
 
     update_data = data.model_dump(exclude_unset=True)
 
@@ -188,11 +196,9 @@ def update_product(
 
 
 @router.delete("/{product_id}", status_code=204)
-def delete_product(product_id: uuid.UUID, db: Session = Depends(get_db)):
+def delete_product(product_id: uuid.UUID, ctx: RequestContext = Depends(allow(*ADMIN)), db: Session = Depends(get_db)):
     """Soft-delete a product (set is_active = False)."""
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
+    product = get_owned(db, Product, product_id, ctx, detail="Product not found")
 
     product.is_active = False
     db.commit()

@@ -49,8 +49,11 @@ class Business(Base):
     email: Mapped[str | None] = mapped_column(String(255))
     upi_id: Mapped[str | None] = mapped_column(String(100))
     logo_url: Mapped[str | None] = mapped_column(Text)
-    bill_prefix: Mapped[str] = mapped_column(String(10), default="INV")
-    bill_counter: Mapped[int] = mapped_column(Integer, default=0)
+    bill_prefix: Mapped[str] = mapped_column(String(5), default="INV")  # invoice series prefix
+    # What happens when a credit bill would push a customer past their limit
+    credit_policy: Mapped[str] = mapped_column(
+        SAEnum("warn", "block", name="credit_policy"), default="block"
+    )
     created_at: Mapped[datetime] = _now()
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
@@ -82,12 +85,62 @@ class User(Base):
         default="owner",
     )
     pin_hash: Mapped[str | None] = mapped_column(String(255))  # bcrypt hash of 4-6 digit PIN
+    pin_failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
     firebase_uid: Mapped[str | None] = mapped_column(String(128))
+    # Bumping this invalidates every access + refresh token issued to the user
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = _now()
 
     # Relationships
     business = relationship("Business", back_populates="users")
+
+
+class RefreshToken(Base):
+    """Rotating refresh tokens. Only the hash of the token is stored."""
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    created_at: Mapped[datetime] = _now()
+
+    __table_args__ = (
+        Index("ix_refresh_tokens_user", "user_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# DOCUMENT SERIES (financial-year invoice numbering)
+# ---------------------------------------------------------------------------
+
+class DocumentSeries(Base):
+    """
+    One row per (business, document type, financial year). The row is locked
+    with SELECT ... FOR UPDATE while a number is issued, so numbers are unique
+    and gap-free (a rolled-back bill does not consume a number).
+    """
+    __tablename__ = "document_series"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("businesses.id"), nullable=False
+    )
+    doc_type: Mapped[str] = mapped_column(
+        SAEnum("invoice", "credit_note", "challan", "receipt", name="document_type"),
+        nullable=False,
+    )
+    fy: Mapped[str] = mapped_column(String(4), nullable=False)  # "2627" = FY 2026-27
+    prefix: Mapped[str] = mapped_column(String(5), nullable=False)
+    next_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("business_id", "doc_type", "fy", name="uq_document_series"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +282,8 @@ class Inventory(Base):
         Uuid, ForeignKey("products.id"), nullable=False, unique=True
     )
     qty_primary: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=0)  # in primary unit
+    # Moving-average landed cost per primary unit (ex-GST)
+    avg_cost: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=0)
     # qty_secondary is derived: qty_primary * conversion_factor — computed on read
     godown_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)  # Phase 2
     last_updated: Mapped[datetime] = mapped_column(
@@ -249,16 +304,20 @@ class InventoryTxn(Base):
     __tablename__ = "inventory_txns"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("businesses.id"), nullable=False
+    )
     inventory_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("inventory.id"), nullable=False
     )
     txn_type: Mapped[str] = mapped_column(
         SAEnum("purchase_in", "sale_out", "return_in", "return_out",
-               "wastage", "adjustment", "transfer",
+               "wastage", "adjustment", "transfer", "sale_reversal",
                name="inventory_txn_type"),
         nullable=False,
     )
     qty_change: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)  # +ve = in, -ve = out
+    unit_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))  # cost per primary unit
     unit: Mapped[str] = mapped_column(String(20))
     reference_type: Mapped[str | None] = mapped_column(String(50))  # 'purchase', 'bill', 'adjustment'
     reference_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
@@ -271,6 +330,7 @@ class InventoryTxn(Base):
 
     __table_args__ = (
         Index("ix_invtxn_inventory_created", "inventory_id", "created_at"),
+        Index("ix_invtxn_business_created", "business_id", "created_at"),
     )
 
 
@@ -364,7 +424,7 @@ class Bill(Base):
     customer_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("customers.id"), nullable=False
     )
-    bill_number: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    bill_number: Mapped[str] = mapped_column(String(16), nullable=False)  # GST: max 16 chars
     bill_date: Mapped[date] = mapped_column(Date, nullable=False)
     bill_type: Mapped[str] = mapped_column(
         SAEnum("invoice", "challan", "credit_note", name="bill_type"),
@@ -374,7 +434,14 @@ class Bill(Base):
     cgst_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
     sgst_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
     igst_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
-    total_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    round_off: Mapped[Decimal] = mapped_column(Numeric(6, 2), default=0)  # to nearest rupee
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)  # after round-off
+    status: Mapped[str] = mapped_column(
+        SAEnum("active", "cancelled", name="bill_status"), default="active", nullable=False
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    cancel_reason: Mapped[str | None] = mapped_column(Text)
+    cancelled_by: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("users.id"))
     payment_status: Mapped[str] = mapped_column(
         SAEnum("paid", "partial", "credit", name="bill_payment_status"),
         default="credit",
@@ -393,6 +460,7 @@ class Bill(Base):
     items = relationship("BillItem", back_populates="bill", cascade="all, delete-orphan")
 
     __table_args__ = (
+        UniqueConstraint("business_id", "bill_number", name="uq_bills_business_number"),
         Index("ix_bills_business_date", "business_id", "bill_date"),
         Index("ix_bills_customer", "customer_id"),
     )
@@ -418,8 +486,8 @@ class BillItem(Base):
     igst_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
     total: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
 
-    # Cost-basis at time of sale — for Phase 2 margin analytics
-    cost_basis: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+    # Moving-average cost per *billed unit* at time of sale — for margin analytics
+    cost_basis: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=0)
 
     # Relationships
     bill = relationship("Bill", back_populates="items")
@@ -478,7 +546,7 @@ class LedgerEntry(Base):
     party_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
     entry_type: Mapped[str] = mapped_column(
         SAEnum("sale", "purchase", "payment_in", "payment_out",
-               "return", "credit_note", "opening_balance",
+               "return", "credit_note", "opening_balance", "sale_cancel",
                name="ledger_entry_type"),
         nullable=False,
     )

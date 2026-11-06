@@ -1,150 +1,184 @@
 """
 KTS — Auth Router
-Phone OTP → verify → JWT token → PIN setup → business setup.
-Uses Firebase Auth for OTP under the hood.
+
+1. Client signs in with Firebase Phone Auth and sends the ID token to POST /auth/firebase.
+2. Server verifies it and returns a short-lived access token + 30-day refresh token.
+3. POST /auth/refresh rotates the refresh token. Logout revokes one or all sessions.
+4. A 4–6 digit PIN gives quick unlock on the device.
 """
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
-from jose import jwt
-from passlib.hash import bcrypt
 import uuid
 
-from app.database import get_db
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.orm import Session
+
 from app.config import settings
-from app.models import User, Business
+from app.database import get_db
+from app.deps import OWNER, RequestContext, allow, get_ctx
+from app.models import Business, User
+from app.rate_limit import limiter
 from app.schemas.auth import (
-    SendOtpRequest, SendOtpResponse,
-    VerifyOtpRequest, VerifyOtpResponse,
-    SetPinRequest, VerifyPinRequest,
-    BusinessSetupRequest, BusinessSetupResponse,
+    BusinessSetupRequest, BusinessSetupResponse, FirebaseLoginRequest, MeResponse,
+    RefreshRequest, SetPinRequest, TokenResponse, VerifyPinRequest, VerifyPinResponse,
 )
+from app.services.auth_service import (
+    create_access_token, hash_pin, issue_refresh_token, revoke_all_sessions,
+    revoke_refresh_token, rotate_refresh_token, verify_phone_identity, verify_pin,
+)
+from slowapi.util import get_remote_address
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
 
 
-# ---------------------------------------------------------------------------
-# Token helpers
-# ---------------------------------------------------------------------------
-
-def create_access_token(user_id: str, business_id: str | None = None) -> str:
-    """Create a JWT access token."""
-    payload = {
-        "sub": user_id,
-        "business_id": business_id,
-        "exp": datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRY_MINUTES),
-        "iat": datetime.utcnow(),
-    }
-    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+def _needs_setup(business: Business | None) -> bool:
+    return business is None or not business.state_code
 
 
-def get_current_user(db: Session = Depends(get_db)):
-    """
-    Dependency — extracts and validates the current user from JWT.
-    For now, returns a mock user for development. Wire Firebase in production.
-    """
-    # TODO: Extract token from Authorization header, verify JWT, fetch user
-    # For development, we'll use a header-based user_id
-    pass
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-@router.post("/send-otp", response_model=SendOtpResponse)
-def send_otp(request: SendOtpRequest):
-    """
-    Step 1: Send OTP to phone number via Firebase.
-    In dev mode, returns a mock session_id.
-    """
-    # TODO: Integrate Firebase Admin SDK — admin.auth().create_session_cookie()
-    # For now, mock it for development
-    return SendOtpResponse(
-        message="OTP sent successfully",
-        session_id=f"dev-session-{uuid.uuid4().hex[:8]}",
-    )
-
-
-@router.post("/verify-otp", response_model=VerifyOtpResponse)
-def verify_otp(request: VerifyOtpRequest, db: Session = Depends(get_db)):
-    """
-    Step 2: Verify OTP → create or fetch user → return JWT.
-    """
-    # TODO: Verify OTP with Firebase — admin.auth().verify_id_token()
-    # For development, accept any 6-digit OTP
-    if len(request.otp) != 6:
-        raise HTTPException(status_code=400, detail="Invalid OTP")
-
-    # Check if user exists
-    user = db.query(User).filter(User.phone == request.phone).first()
-    is_new = user is None
-    has_business = False
-
-    if is_new:
-        # Create new user (without business — that comes next)
-        user = User(
-            id=uuid.uuid4(),
-            business_id=uuid.uuid4(),  # placeholder, will be updated in business setup
-            name="New User",
-            phone=request.phone,
-            role="owner",
-        )
-        # We need a business first — create a placeholder
-        placeholder_biz = Business(
-            id=user.business_id,
-            name="My Business",
-        )
-        db.add(placeholder_biz)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    else:
-        has_business = user.business is not None and user.business.name != "My Business"
-
-    token = create_access_token(
+def _token_response(db: Session, user: User, *, is_new: bool = False) -> TokenResponse:
+    refresh_raw, _ = issue_refresh_token(db, user)
+    db.commit()
+    return TokenResponse(
+        access_token=create_access_token(user),
+        refresh_token=refresh_raw,
+        expires_in=settings.JWT_EXPIRY_MINUTES * 60,
         user_id=str(user.id),
         business_id=str(user.business_id),
-    )
-
-    return VerifyOtpResponse(
-        access_token=token,
-        user_id=str(user.id),
+        role=user.role,
         is_new_user=is_new,
-        has_business=has_business,
+        needs_business_setup=_needs_setup(db.get(Business, user.business_id)),
     )
 
 
-@router.post("/set-pin")
-def set_pin(request: SetPinRequest, db: Session = Depends(get_db)):
+@router.post("/firebase", response_model=TokenResponse)
+@limiter.limit(settings.RATE_LIMIT_AUTH, key_func=get_remote_address)
+def firebase_login(request: Request, data: FirebaseLoginRequest, db: Session = Depends(get_db)):
     """
-    Step 3: Set a 4-6 digit PIN for quick app unlock.
+    Exchange a Firebase phone-auth ID token for KTS tokens.
+    A phone number seen for the first time becomes the owner of a new business;
+    staff are invited by an owner first (POST /api/v1/users) and then sign in here.
     """
-    # TODO: Extract user from JWT
-    # For now, require user_id as query param for dev
-    # In production: user = get_current_user()
-    raise HTTPException(status_code=501, detail="Wire after Firebase integration")
+    identity = verify_phone_identity(data.id_token)
+
+    user = db.query(User).filter(User.phone == identity.phone).first()
+    is_new = user is None
+    if user is None:
+        business = Business(id=uuid.uuid4(), name="My Business", phone=identity.phone)
+        db.add(business)
+        user = User(
+            id=uuid.uuid4(),
+            business_id=business.id,
+            name="Owner",
+            phone=identity.phone,
+            role="owner",
+            firebase_uid=identity.firebase_uid,
+        )
+        db.add(user)
+        db.flush()
+    else:
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="This account has been disabled")
+        if identity.firebase_uid and user.firebase_uid != identity.firebase_uid:
+            user.firebase_uid = identity.firebase_uid
+
+    return _token_response(db, user, is_new=is_new)
 
 
-@router.post("/setup-business", response_model=BusinessSetupResponse)
-def setup_business(request: BusinessSetupRequest, db: Session = Depends(get_db)):
-    """
-    Step 4: Complete business setup (name, GSTIN, state, etc.)
-    Called once after first login.
-    """
-    # TODO: Get user from JWT and update their business
-    # For development: create standalone
-    business = Business(
-        id=uuid.uuid4(),
-        name=request.name,
-        gstin=request.gstin,
-        state_code=request.state_code,
-        address=request.address,
-        phone=request.phone,
-        upi_id=request.upi_id,
-        bill_prefix=request.bill_prefix,
+@router.post("/refresh", response_model=TokenResponse)
+@limiter.limit(settings.RATE_LIMIT_AUTH, key_func=get_remote_address)
+def refresh(request: Request, data: RefreshRequest, db: Session = Depends(get_db)):
+    """Rotate a refresh token. The old one stops working immediately."""
+    user, new_refresh = rotate_refresh_token(db, data.refresh_token)
+    db.commit()
+    return TokenResponse(
+        access_token=create_access_token(user),
+        refresh_token=new_refresh,
+        expires_in=settings.JWT_EXPIRY_MINUTES * 60,
+        user_id=str(user.id),
+        business_id=str(user.business_id),
+        role=user.role,
+        needs_business_setup=_needs_setup(db.get(Business, user.business_id)),
     )
-    db.add(business)
+
+
+@router.post("/logout", status_code=204)
+def logout(data: RefreshRequest, ctx: RequestContext = Depends(get_ctx), db: Session = Depends(get_db)):
+    """Revoke this device's refresh token."""
+    revoke_refresh_token(db, data.refresh_token, ctx.user_id)
     db.commit()
 
+
+@router.post("/logout-all", status_code=204)
+def logout_all(ctx: RequestContext = Depends(get_ctx), db: Session = Depends(get_db)):
+    """Revoke every session of the current user, on every device."""
+    revoke_all_sessions(db, db.get(User, ctx.user_id))
+    db.commit()
+
+
+@router.get("/me", response_model=MeResponse)
+def me(ctx: RequestContext = Depends(get_ctx), db: Session = Depends(get_db)):
+    user = db.get(User, ctx.user_id)
+    business = db.get(Business, ctx.business_id)
+    return MeResponse(
+        user_id=str(user.id),
+        name=user.name,
+        phone=user.phone,
+        role=user.role,
+        business_id=str(business.id),
+        business_name=business.name,
+        has_pin=user.pin_hash is not None,
+        needs_business_setup=_needs_setup(business),
+    )
+
+
+@router.post("/set-pin", status_code=204)
+def set_pin(data: SetPinRequest, ctx: RequestContext = Depends(get_ctx), db: Session = Depends(get_db)):
+    """Set or change the 4–6 digit quick-unlock PIN."""
+    user = db.get(User, ctx.user_id)
+    user.pin_hash = hash_pin(data.pin)
+    user.pin_failed_attempts = 0
+    db.commit()
+
+
+@router.post("/verify-pin", response_model=VerifyPinResponse)
+@limiter.limit(settings.RATE_LIMIT_AUTH)
+def check_pin(
+    request: Request,
+    data: VerifyPinRequest,
+    ctx: RequestContext = Depends(get_ctx),
+    db: Session = Depends(get_db),
+):
+    """
+    Check the quick-unlock PIN. After PIN_MAX_ATTEMPTS failures every session is
+    revoked and the user must sign in with their phone again.
+    """
+    user = db.get(User, ctx.user_id)
+    if not user.pin_hash:
+        raise HTTPException(status_code=400, detail="No PIN set")
+
+    if verify_pin(data.pin, user.pin_hash):
+        user.pin_failed_attempts = 0
+        db.commit()
+        return VerifyPinResponse(valid=True, attempts_remaining=settings.PIN_MAX_ATTEMPTS)
+
+    user.pin_failed_attempts = (user.pin_failed_attempts or 0) + 1
+    remaining = settings.PIN_MAX_ATTEMPTS - user.pin_failed_attempts
+    if remaining <= 0:
+        user.pin_failed_attempts = 0
+        revoke_all_sessions(db, user)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Too many wrong PINs. Please sign in again.")
+    db.commit()
+    return VerifyPinResponse(valid=False, attempts_remaining=remaining)
+
+
+@router.put("/business", response_model=BusinessSetupResponse)
+def setup_business(
+    data: BusinessSetupRequest,
+    ctx: RequestContext = Depends(allow(*OWNER)),
+    db: Session = Depends(get_db),
+):
+    """Complete or update the business profile of the signed-in owner."""
+    business = db.get(Business, ctx.business_id)
+    for key, value in data.model_dump().items():
+        setattr(business, key, value)
+    db.commit()
     return BusinessSetupResponse(business_id=str(business.id))

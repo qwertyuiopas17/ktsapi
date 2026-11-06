@@ -2,6 +2,8 @@
 KTS — Purchase, Bill, Payment, Inventory Schemas
 The transactional core — every one of these mutations moves stock, updates ledger, or both.
 """
+from typing import Literal
+
 from pydantic import BaseModel, Field
 from decimal import Decimal
 from datetime import date, datetime
@@ -28,10 +30,10 @@ class PurchaseCreate(BaseModel):
     invoice_number: str | None = None
     invoice_date: date | None = None
     items: list[PurchaseItemCreate] = Field(..., min_length=1)
-    payment_status: str = "credit"  # paid, partial, credit
+    payment_status: Literal["paid", "partial", "credit"] = "credit"
     amount_paid: Decimal = Field(default=Decimal("0"), ge=0)
     ocr_image_url: str | None = None
-    source: str = "manual"  # manual or ocr
+    source: Literal["manual", "ocr"] = "manual"
 
 
 class PurchaseItemResponse(BaseModel):
@@ -89,9 +91,10 @@ class BillItemCreate(BaseModel):
 class BillCreate(BaseModel):
     customer_id: UUID
     bill_date: date | None = None  # defaults to today
-    bill_type: str = "invoice"  # invoice, challan, credit_note
+    # Credit notes need their own flow (stock back in, not out) and arrive in Phase 3
+    bill_type: Literal["invoice", "challan"] = "invoice"
     items: list[BillItemCreate] = Field(..., min_length=1)
-    payment_status: str = "credit"  # paid, partial, credit
+    payment_status: Literal["paid", "partial", "credit"] = "credit"
     amount_paid: Decimal = Field(default=Decimal("0"), ge=0)
     payment_mode: str | None = None  # cash, upi, bank_transfer
 
@@ -124,13 +127,22 @@ class BillResponse(BaseModel):
     cgst_amount: Decimal
     sgst_amount: Decimal
     igst_amount: Decimal
+    round_off: Decimal = Decimal("0")
     total_amount: Decimal
+    status: str = "active"
+    cancelled_at: datetime | None = None
+    cancel_reason: str | None = None
     payment_status: str
     amount_paid: Decimal
     payment_mode: str | None
     items: list[BillItemResponse] = []
     created_at: datetime
+    warnings: list[str] = []
     model_config = {"from_attributes": True}
+
+
+class BillCancelRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
 
 
 class BillListResponse(BaseModel):
@@ -143,10 +155,10 @@ class BillListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class PaymentCreate(BaseModel):
-    party_type: str  # customer or company
+    party_type: Literal["customer", "company"]
     party_id: UUID
     amount: Decimal = Field(..., gt=0)
-    payment_mode: str = "cash"
+    payment_mode: Literal["cash", "upi", "bank_transfer", "cheque"] = "cash"
     payment_date: date | None = None
     reference: str | None = None
     note: str | None = None
@@ -198,16 +210,46 @@ class StockDashboardResponse(BaseModel):
     out_of_stock_count: int
 
 
+AdjustReason = Literal["stock_count", "damage", "expiry", "theft", "measurement_error", "personal_use", "opening_stock"]
+
+
 class StockAdjustRequest(BaseModel):
     product_id: UUID
-    actual_qty: Decimal = Field(..., ge=0)
-    reason: str  # damage, theft, measurement_error, personal_use
+    actual_qty: Decimal = Field(..., ge=0, description="Counted quantity in the primary unit")
+    reason: AdjustReason
+
+
+class StockCountLine(BaseModel):
+    product_id: UUID
+    actual_qty: Decimal = Field(..., ge=0, description="Counted quantity in the primary unit")
+    unit_cost: Decimal | None = Field(None, ge=0, description="Only for opening_stock: cost per primary unit")
+
+
+class StockAdjustmentBatch(BaseModel):
+    reason: AdjustReason
+    note: str | None = Field(None, max_length=500)
+    items: list[StockCountLine] = Field(..., min_length=1, max_length=500)
+
+
+class StockAdjustmentLineResult(BaseModel):
+    product_id: UUID
+    product_name: str
+    previous_qty: Decimal
+    actual_qty: Decimal
+    difference: Decimal
+
+
+class StockAdjustmentBatchResponse(BaseModel):
+    adjustment_id: UUID
+    reason: str
+    items: list[StockAdjustmentLineResult]
 
 
 class InventoryTxnResponse(BaseModel):
     id: UUID
     txn_type: str
     qty_change: Decimal
+    unit_cost: Decimal | None = None
     unit: str | None
     reference_type: str | None
     note: str | None

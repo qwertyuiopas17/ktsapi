@@ -15,14 +15,11 @@ Pipeline:
 from __future__ import annotations
 
 import base64
-import io
 import json
 import os
 import re
 import sys
 from pathlib import Path
-from decimal import Decimal
-from datetime import date
 
 # PDF to image conversion (ported from user's sih2026/extract_biology.py pattern)
 try:

@@ -1,6 +1,6 @@
 # Models package — re-exports all models for clean imports
 from app.models.models import (
-    Business, User, Company, Customer, Product,
+    Business, User, RefreshToken, DocumentSeries, Company, Customer, Product,
     Inventory, InventoryTxn,
     Purchase, PurchaseItem,
     Bill, BillItem,
@@ -8,7 +8,7 @@ from app.models.models import (
 )
 
 __all__ = [
-    "Business", "User", "Company", "Customer", "Product",
+    "Business", "User", "RefreshToken", "DocumentSeries", "Company", "Customer", "Product",
     "Inventory", "InventoryTxn",
     "Purchase", "PurchaseItem",
     "Bill", "BillItem",

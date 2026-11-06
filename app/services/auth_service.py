@@ -1,127 +1,195 @@
 """
-KTS — JWT Auth Dependencies
-Ported from aethel-backend-v3/auth.py with adaptations for KTS:
-  - Phone-based auth (not email/password)
-  - UUID user IDs (not integer)
-  - Business context (multi-tenant)
+KTS — Authentication service
 
-Uses PyJWT for stateless token encoding.
-Tokens carry: sub (user_id), business_id, phone, role.
+- Access tokens: short-lived HS256 JWTs carrying sub (user id), business_id,
+  role and ver (the user's token_version, used for server-side revocation).
+- Refresh tokens: opaque random strings, 30 days, rotated on every use. Only a
+  SHA-256 hash is stored. Re-using a rotated token revokes every session of
+  that user (theft detection).
+- Phone identity comes from a Firebase ID token verified server-side.
 """
 from __future__ import annotations
 
-import sys
+import hashlib
+import secrets
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
 
-try:
-    import jwt
-except ImportError:
-    print("[KTS Auth] WARNING: PyJWT not installed. Run: pip install PyJWT", file=sys.stderr)
-    jwt = None  # type: ignore
-
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+import bcrypt
+import jwt
+from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import get_db
-
-# ─── Config ──────────────────────────────────────────────────
-_JWT_SECRET = settings.JWT_SECRET_KEY
-_JWT_ALGORITHM = settings.JWT_ALGORITHM
-_JWT_EXPIRY_MINUTES = settings.JWT_EXPIRY_MINUTES
-
-_bearer_scheme = HTTPBearer(auto_error=False)
+from app.models import RefreshToken, User
 
 
-# ─── Token helpers ────────────────────────────────────────────
-def create_token(user_id: str, business_id: str, phone: str, role: str = "owner") -> str:
-    """
-    Create a signed JWT access token.
-    Payload: sub (user_id), business_id, phone, role, exp, iat.
-    """
-    if jwt is None:
-        raise RuntimeError("PyJWT library not installed")
+def _utcnow() -> datetime:
+    # Naive UTC, matching the DateTime columns in the models
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _unauthorized(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+# ─── PIN ─────────────────────────────────────────────────────
+def hash_pin(pin: str) -> str:
+    return bcrypt.hashpw(pin.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_pin(pin: str, pin_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(pin.encode(), pin_hash.encode())
+    except ValueError:
+        return False
+
+
+# ─── Access tokens ───────────────────────────────────────────
+def create_access_token(user: User) -> str:
     now = datetime.now(timezone.utc)
     payload = {
-        "sub": str(user_id),
-        "business_id": str(business_id),
-        "phone": phone,
-        "role": role,
+        "sub": str(user.id),
+        "business_id": str(user.business_id),
+        "role": user.role,
+        "ver": user.token_version or 0,
+        "type": "access",
         "iat": now,
-        "exp": now + timedelta(minutes=_JWT_EXPIRY_MINUTES),
+        "exp": now + timedelta(minutes=settings.JWT_EXPIRY_MINUTES),
     }
-    return jwt.encode(payload, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
-def decode_token(token: str) -> dict | None:
-    """
-    Decode and validate a JWT. Returns payload dict or None on failure.
-    Raises nothing — caller must check for None.
-    """
-    if jwt is None:
-        return None
+def decode_access_token(token: str) -> dict | None:
+    """Returns the verified payload, or None if the token is invalid/expired."""
     try:
-        payload = jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
-        return payload
-    except Exception:
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    except jwt.PyJWTError:
         return None
-
-
-# ─── FastAPI dependencies ─────────────────────────────────────
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-    db: Session = Depends(get_db),
-):
-    """
-    FastAPI dependency. Extracts and validates the Bearer token.
-    Returns a dict with user_id, business_id, phone, role.
-    Raises HTTP 401 on missing/invalid token.
-
-    Pattern from: aethel-backend-v3/auth.py
-    """
-    if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated. Please log in.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    payload = decode_token(credentials.credentials)
-    if payload is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token. Please log in again.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    return {
-        "user_id": UUID(payload["sub"]),
-        "business_id": UUID(payload["business_id"]),
-        "phone": payload.get("phone", ""),
-        "role": payload.get("role", "owner"),
-    }
-
-
-async def get_optional_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-    db: Session = Depends(get_db),
-):
-    """
-    Like get_current_user but does NOT raise on missing token.
-    Returns user dict or None. Use on endpoints that work for both
-    authenticated and anonymous users (e.g. /health).
-
-    Pattern from: aethel-backend-v3/auth.py
-    """
-    if credentials is None:
+    if payload.get("type") != "access":
         return None
-    payload = decode_token(credentials.credentials)
-    if payload is None:
-        return None
-    return {
-        "user_id": UUID(payload["sub"]),
-        "business_id": UUID(payload["business_id"]),
-        "phone": payload.get("phone", ""),
-        "role": payload.get("role", "owner"),
-    }
+    return payload
+
+
+# ─── Refresh tokens ──────────────────────────────────────────
+def _hash_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def issue_refresh_token(db: Session, user: User) -> tuple[str, RefreshToken]:
+    raw = secrets.token_urlsafe(48)
+    row = RefreshToken(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        token_hash=_hash_token(raw),
+        token_version=user.token_version or 0,
+        expires_at=_utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRY_DAYS),
+    )
+    db.add(row)
+    return raw, row
+
+
+def rotate_refresh_token(db: Session, raw: str) -> tuple[User, str]:
+    """Validate a refresh token, revoke it and issue its replacement."""
+    row = (
+        db.query(RefreshToken)
+        .filter(RefreshToken.token_hash == _hash_token(raw))
+        .with_for_update()
+        .first()
+    )
+    if row is None:
+        raise _unauthorized("Invalid refresh token")
+
+    user = db.get(User, row.user_id)
+    if user is None or not user.is_active:
+        raise _unauthorized("Account disabled")
+
+    if row.revoked_at is not None:
+        if row.replaced_by_id is not None:
+            # A rotated token was presented again: assume it leaked and end every session.
+            revoke_all_sessions(db, user)
+            db.commit()
+            raise _unauthorized("Refresh token reuse detected; all sessions revoked")
+        raise _unauthorized("Refresh token revoked")
+
+    if row.expires_at < _utcnow() or row.token_version != (user.token_version or 0):
+        raise _unauthorized("Refresh token expired")
+
+    new_raw, new_row = issue_refresh_token(db, user)
+    row.revoked_at = _utcnow()
+    row.replaced_by_id = new_row.id
+    return user, new_raw
+
+
+def revoke_refresh_token(db: Session, raw: str, user_id: uuid.UUID) -> None:
+    row = (
+        db.query(RefreshToken)
+        .filter(RefreshToken.token_hash == _hash_token(raw), RefreshToken.user_id == user_id)
+        .first()
+    )
+    if row is not None and row.revoked_at is None:
+        row.revoked_at = _utcnow()
+
+
+def revoke_all_sessions(db: Session, user: User) -> None:
+    """Invalidates all access tokens (via token_version) and refresh tokens."""
+    user.token_version = (user.token_version or 0) + 1
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None)
+    ).update({RefreshToken.revoked_at: _utcnow()}, synchronize_session=False)
+
+
+# ─── Firebase phone identity ─────────────────────────────────
+@dataclass
+class PhoneIdentity:
+    phone: str
+    firebase_uid: str | None
+
+
+_firebase_app = None
+
+
+def _get_firebase_app():
+    global _firebase_app
+    if _firebase_app is None:
+        import firebase_admin
+        from firebase_admin import credentials
+
+        options = {"projectId": settings.FIREBASE_PROJECT_ID} if settings.FIREBASE_PROJECT_ID else None
+        try:
+            cred = credentials.Certificate(settings.FIREBASE_CREDENTIALS_PATH)
+        except (FileNotFoundError, ValueError):
+            cred = credentials.ApplicationDefault()
+        _firebase_app = firebase_admin.initialize_app(cred, options)
+    return _firebase_app
+
+
+def verify_phone_identity(id_token: str) -> PhoneIdentity:
+    """
+    Verify a Firebase ID token issued after Firebase Phone Auth on the client.
+    In development/test with AUTH_DEV_STUB=true, "dev:+919876543210" is accepted.
+    """
+    if settings.AUTH_DEV_STUB and not settings.is_production_like and id_token.startswith("dev:"):
+        phone = id_token[4:]
+        if not phone.startswith("+") or not phone[1:].isdigit() or not 10 <= len(phone) <= 15:
+            raise _unauthorized("Dev token must look like dev:+919876543210")
+        return PhoneIdentity(phone=phone, firebase_uid=None)
+
+    try:
+        from firebase_admin import auth as fb_auth
+
+        decoded = fb_auth.verify_id_token(id_token, app=_get_firebase_app(), check_revoked=True)
+    except ImportError as exc:  # pragma: no cover - deployment misconfiguration
+        raise HTTPException(status_code=503, detail="Phone auth is not configured") from exc
+    except Exception as exc:
+        raise _unauthorized("Invalid or expired phone verification") from exc
+
+    phone = decoded.get("phone_number")
+    if not phone:
+        raise _unauthorized("Token has no verified phone number")
+    return PhoneIdentity(phone=phone, firebase_uid=decoded.get("uid"))

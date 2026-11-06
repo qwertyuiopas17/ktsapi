@@ -1,0 +1,12 @@
+.git
+.github
+__pycache__
+*.pyc
+.venv
+venv
+.env
+*.db
+firebase-credentials.json
+google-credentials.json
+tests
+docs

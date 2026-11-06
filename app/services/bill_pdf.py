@@ -12,18 +12,17 @@ from __future__ import annotations
 
 import io
 import sys
-from decimal import Decimal
 from datetime import date, datetime
 
 try:
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, mm
+    from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm as MM
     from reportlab.platypus import (
         SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable,
     )
-    from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 except ImportError:
     print("[KTS PDF] WARNING: reportlab not installed. Run: pip install reportlab", file=sys.stderr)
     SimpleDocTemplate = None
@@ -119,6 +118,10 @@ def generate_bill_pdf(
     story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
     story.append(Spacer(1, 3 * MM))
 
+    if bill_data.get("status") == "cancelled":
+        story.append(Paragraph("<b>CANCELLED</b>", title_style))
+        story.append(Spacer(1, 2 * MM))
+
     # ─── Invoice Info ───
     bill_number = bill_data.get("bill_number", "N/A")
     bill_date = bill_data.get("bill_date", str(date.today()))
@@ -200,6 +203,10 @@ def generate_bill_pdf(
         totals_data.append(["SGST", f"Rs {sgst:.2f}"])
     if float(igst) > 0:
         totals_data.append(["IGST", f"Rs {igst:.2f}"])
+
+    round_off = float(bill_data.get("round_off", 0) or 0)
+    if round_off:
+        totals_data.append(["Round off", f"Rs {round_off:+.2f}"])
 
     totals_data.append(["TOTAL", f"Rs {total:.2f}"])
 

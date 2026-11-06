@@ -1,0 +1,330 @@
+{
+ "_comment": "HSN prefix -> GST rate with effective dates. Longest matching prefix wins. GST 2.0 rates effective 2025-09-22. Rows marked requires_ca_review must be confirmed by a CA before release; cess is recorded but not yet applied on invoices.",
+ "rates": [
+  {
+   "hsn_prefix": "0401",
+   "rate": 0,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Fresh milk"
+  },
+  {
+   "hsn_prefix": "0702",
+   "rate": 0,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Tomatoes, fresh"
+  },
+  {
+   "hsn_prefix": "0713",
+   "rate": 0,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Dried pulses, loose",
+   "note": "Pre-packaged and labelled pulses attract 5%"
+  },
+  {
+   "hsn_prefix": "1006",
+   "rate": 0,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Rice, loose",
+   "note": "Pre-packaged and labelled rice attracts 5%"
+  },
+  {
+   "hsn_prefix": "1101",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Wheat flour (atta), pre-packaged",
+   "note": "Loose atta is 0%"
+  },
+  {
+   "hsn_prefix": "1701",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Sugar"
+  },
+  {
+   "hsn_prefix": "0902",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Tea"
+  },
+  {
+   "hsn_prefix": "1507",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Soybean oil"
+  },
+  {
+   "hsn_prefix": "1508",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Groundnut oil"
+  },
+  {
+   "hsn_prefix": "1512",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Sunflower oil"
+  },
+  {
+   "hsn_prefix": "1514",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Mustard/rapeseed oil"
+  },
+  {
+   "hsn_prefix": "1515",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Other edible vegetable oils"
+  },
+  {
+   "hsn_prefix": "0405",
+   "rate": 12,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": "2025-09-21",
+   "description": "Butter, ghee"
+  },
+  {
+   "hsn_prefix": "0405",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Butter, ghee"
+  },
+  {
+   "hsn_prefix": "1806",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": "2025-09-21",
+   "description": "Chocolate and cocoa preparations"
+  },
+  {
+   "hsn_prefix": "1806",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Chocolate and cocoa preparations"
+  },
+  {
+   "hsn_prefix": "1901",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": "2025-09-21",
+   "description": "Malt extract and food preparations"
+  },
+  {
+   "hsn_prefix": "1901",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Malt extract and food preparations"
+  },
+  {
+   "hsn_prefix": "1902",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Pasta and noodles"
+  },
+  {
+   "hsn_prefix": "1905",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": "2025-09-21",
+   "description": "Biscuits, bakery products"
+  },
+  {
+   "hsn_prefix": "1905",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Biscuits, bakery products"
+  },
+  {
+   "hsn_prefix": "2106",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": "2025-09-21",
+   "description": "Food preparations n.e.s.",
+   "note": "Namkeen/bhujia were 12% before GST 2.0"
+  },
+  {
+   "hsn_prefix": "2106",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Food preparations n.e.s. (namkeen, bhujia, etc.)"
+  },
+  {
+   "hsn_prefix": "21069020",
+   "rate": 28,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Pan masala",
+   "note": "Compensation cess applies until the cess regime ends; then 40%",
+   "requires_ca_review": true
+  },
+  {
+   "hsn_prefix": "2202",
+   "rate": 28,
+   "cess_rate": 12,
+   "effective_from": "2017-07-01",
+   "effective_to": "2025-09-21",
+   "description": "Aerated waters with added sugar"
+  },
+  {
+   "hsn_prefix": "2202",
+   "rate": 40,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Aerated waters / sweetened beverages",
+   "note": "Confirm tariff line: some non-aerated 2202 beverages are taxed differently",
+   "requires_ca_review": true
+  },
+  {
+   "hsn_prefix": "2402",
+   "rate": 28,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Cigarettes, cigars",
+   "note": "Compensation cess (specific + ad valorem) applies until the cess regime ends; then 40%",
+   "requires_ca_review": true
+  },
+  {
+   "hsn_prefix": "2403",
+   "rate": 28,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Other manufactured tobacco",
+   "note": "Compensation cess applies until the cess regime ends; then 40%",
+   "requires_ca_review": true
+  },
+  {
+   "hsn_prefix": "3305",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": "2025-09-21",
+   "description": "Hair oil, shampoo"
+  },
+  {
+   "hsn_prefix": "3305",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Hair oil, shampoo"
+  },
+  {
+   "hsn_prefix": "3306",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": "2025-09-21",
+   "description": "Toothpaste, tooth powder"
+  },
+  {
+   "hsn_prefix": "3306",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Toothpaste, tooth powder"
+  },
+  {
+   "hsn_prefix": "3401",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": "2025-09-21",
+   "description": "Toilet soap"
+  },
+  {
+   "hsn_prefix": "3401",
+   "rate": 5,
+   "cess_rate": 0,
+   "effective_from": "2025-09-22",
+   "effective_to": null,
+   "description": "Toilet soap",
+   "note": "Industrial soap stays at 18%"
+  },
+  {
+   "hsn_prefix": "3402",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Detergents, washing preparations"
+  },
+  {
+   "hsn_prefix": "7317",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Nails, tacks, staples"
+  },
+  {
+   "hsn_prefix": "8414",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Fans, blowers"
+  },
+  {
+   "hsn_prefix": "8418",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Refrigerators"
+  },
+  {
+   "hsn_prefix": "8516",
+   "rate": 18,
+   "cess_rate": 0,
+   "effective_from": "2017-07-01",
+   "effective_to": null,
+   "description": "Electric heaters, irons"
+  }
+ ]
+}
