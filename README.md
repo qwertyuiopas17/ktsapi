@@ -81,146 +81,81 @@ Log business expenses (fuel, rent, salary, transport, etc.) with category-wise P
 
 ## Current Status
 
-### What is Built (Sprint 1 + Sprint 2 — Complete)
+**Phase 1 (secure and correct foundation) — implemented.** See
+[`docs/kts-implementation-plan.md`](docs/kts-implementation-plan.md) for the
+full 4-phase plan and [`docs/kts-kolkata-gtm.md`](docs/kts-kolkata-gtm.md) for
+the go-to-market plan.
 
-**Database Layer — 15 tables, fully modeled:**
+| Area | What Phase 1 delivers |
+|:--|:--|
+| Auth | Firebase Phone Auth ID token → `POST /auth/firebase` → 60-min access JWT + 30-day rotating refresh token (reuse detection), `token_version` revocation, logout / logout-all, bcrypt PIN unlock with lockout |
+| Tenancy | No hardcoded business id. Every route takes a `RequestContext`; every lookup is scoped by `business_id` (`get_owned` returns 404 across tenants) |
+| Roles | owner / accountant / manager / delivery / warehouse matrix (`app/deps.py`); staff are invited by the owner (`/api/v1/users`) |
+| Invoices | Per-business, per-FY, gap-free series `INV/2627/00042` (row-locked); separate series for challans; round-off to the rupee; bills are cancelled (stock + ledger reversed), never deleted |
+| GST | Effective-dated HSN rate table (`data/hsn_rates.json`) with GST 2.0 rates from 22 Sep 2025 (soap, hair oil, shampoo, toothpaste → 5%) |
+| Stock & cost | `SELECT … FOR UPDATE` on inventory, explicit txn types, moving-average landed cost (`Inventory.avg_cost`), `BillItem.cost_basis` per billed unit, damaged goods written off as wastage, batch stock counts / opening stock |
+| Platform | Alembic is the only schema source, pytest suite on Postgres in CI, ruff, Dockerfile + docker-compose, rate limiting, JSON logs, Sentry hook, [operations runbook](docs/operations.md) |
 
-| Model | Purpose |
-|:------|:--------|
-| Business | Multi-tenant root (name, GSTIN, state, bill prefix) |
-| User | Phone auth, Firebase UID, PIN, role |
-| Product | Name, shortcode, HSN, GST rate, units, conversion factor, 3 sell prices, low-stock threshold |
-| Customer | Name, phone, address, state, GSTIN, credit limit, outstanding, price tier |
-| Company | Supplier — name, GSTIN, state, contact, outstanding |
-| Inventory | Per-product stock (primary + secondary units) |
-| InventoryTxn | Audit trail — every stock movement with type, qty, timestamp, reference |
-| Purchase | Inbound goods — invoice number, date, totals, payment status, OCR source/confidence |
-| PurchaseItem | Line items with discount, damaged qty, cost basis |
-| Bill | Outbound invoice — bill number, type, GST breakdown, payment status |
-| BillItem | Line items with cost basis at time of sale |
-| Payment | Cash/UPI/bank payments for customers and suppliers |
-| LedgerEntry | Double-entry audit trail with running balances |
-| Expense | Business expenses with 9 categories |
-
-**API Endpoints — 35+ built and tested:**
-
-| Group | Endpoints | Key Features |
-|:------|:----------|:-------------|
-| Auth | 2 | Phone OTP send/verify, JWT token generation |
-| Products | 6 | CRUD + search + HSN auto-lookup + auto inventory init |
-| Customers | 5 | CRUD + search by name/phone |
-| Companies | 5 | CRUD + search by name/GSTIN |
-| Purchases | 3 | Create (auto stock-in + wastage + ledger), list, OCR scan |
-| Bills | 4 | Create (auto GST + stock-out + credit check + ledger), list, PDF, WhatsApp share |
-| Payments | 1 | Record payment (auto ledger + outstanding update) |
-| Ledger | 2 | Party transaction history, outstanding summary |
-| Inventory | 1 | Live stock levels with low-stock filtering |
-| Dashboard | 1 | Today's sales, purchases, expenses, low stock count, overdue count |
-| Expenses | 5 | CRUD + category-wise P&L summary |
-
-**Business Logic Services — 6 built:**
-
-| Service | What It Does |
-|:--------|:-------------|
-| `gst_engine.py` | GST calculation: 5 slabs (0/5/12/18/28%) x intra/inter-state = auto CGST+SGST or IGST |
-| `inventory_service.py` | Stock in/out/wastage/adjustment with InventoryTxn audit trail |
-| `auth_service.py` | JWT creation + validation, `get_current_user` dependency |
-| `ocr_service.py` | Groq Vision OCR, PDF-to-image, rotating API keys, structured extraction |
-| `bill_pdf.py` | PDF invoice generation (A4 formal + 80mm thermal receipt) |
-| `unit_converter.py` | Primary-to-secondary unit conversion (Bag to Kg, Can to L, etc.) |
-
-**Testing — 2 suites, all passing:**
-
-| Suite | Tests | Coverage |
-|:------|:------|:---------|
-| `test_e2e.py` | ~11 | Full flow: Product > Customer > Company > Purchase > Inventory > Bill > Payment > Ledger > Dashboard |
-| `test_improvements.py` | 15 | JWT auth, OCR endpoint, Bill PDF (A4+thermal), WhatsApp share, Expense CRUD, category summary |
-
----
-
-### What is NOT Built Yet
-
-#### Backend Remaining (~7 working days)
-
-| # | Task | Priority | Why |
-|:--|:-----|:---------|:----|
-| 1 | Wire JWT auth to all endpoints | P0 | All routes currently open — auth service built but not plugged in |
-| 2 | Firebase real phone auth | P0 | OTP verification is stubbed (always succeeds) |
-| 3 | Multi-tenancy | P0 | Hardcoded BUSINESS_ID — must extract from JWT |
-| 4 | Bill return / credit note | P1 | Stock re-add + ledger reversal on customer returns |
-| 5 | Delivery challan | P2 | Goods movement without tax invoice, convert to invoice later |
-| 6 | OCR confidence gating | P1 | 4-state validation: confirming / needs-fix / auto-committed / failed |
-| 7 | Per-supplier OCR template learning | P2 | Auto-commit after 50 clean scans from same supplier |
-| 8 | S3 image upload | P1 | Bill images processed but not persisted |
-| 9 | Google Document AI fallback | P2 | Production OCR fallback for low-confidence Groq results |
-| 10 | Payment reminder scheduler | P2 | WhatsApp reminders for overdue payments |
-| 11 | Bulk product import (CSV/Excel) | P2 | Mass product onboarding |
-| 12 | Global search | P2 | Unified search across all entities |
-| 13 | Stock adjustment endpoint | P1 | Physical count reconciliation (service exists, endpoint does not) |
-| 14 | Rate limiting | P1 | slowapi installed but not configured |
-| 15 | Recurring expenses | P3 | Template-based recurring expense reminders |
-| 16 | Deployment | P1 | Dockerfile, CI/CD, hosting config |
-
-#### Frontend (~10-12 weeks)
-
-The React Native mobile app (Expo + TypeScript) is **not started**. A complete [Frontend Design Specification](FRONTEND_DESIGN_SPEC.md) has been written covering color system, typography, component library, wireframes for 9 screens, interaction patterns, and tech stack.
+Still open from Phase 1 (need accounts/infrastructure rather than code):
+staging deployment in Mumbai, Sentry project, S3 presigned uploads, first
+backup restore drill, CA confirmation of tobacco/pan-masala cess.
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-- Python 3.11+
-- PostgreSQL (production) or SQLite (development — works out of the box)
-
-### Setup
+### With Docker (Postgres + Redis)
 
 ```bash
-# Clone
-git clone https://github.com/qwertyuiopas17/ktsapi.git
-cd ktsapi
+cp .env.example .env            # keep AUTH_DEV_STUB=true for local work
+docker compose up --build       # runs `alembic upgrade head`, then the API on :8000
+```
 
-# Virtual environment
-python -m venv venv
-venv\Scripts\activate          # Windows
-source venv/bin/activate       # Linux/Mac
+### Without Docker
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure environment
-copy .env.example .env         # Windows
-cp .env.example .env           # Linux/Mac
-# Edit .env with your settings (JWT secret, database URL, API keys)
-
-# Run the server
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-
-# Open API docs
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+cp .env.example .env            # set DATABASE_URL (SQLite works for quick local runs)
+alembic upgrade head
+uvicorn app.main:app --reload
 # http://localhost:8000/docs
+```
+
+Local sign-in without Firebase (development only, `AUTH_DEV_STUB=true`):
+
+```bash
+curl -X POST localhost:8000/api/v1/auth/firebase -H 'content-type: application/json' \
+     -d '{"id_token": "dev:+919876543210"}'
 ```
 
 ### Run Tests
 
 ```bash
-# Sprint 1 — full E2E flow
-pytest test_e2e.py -v
-
-# Sprint 2 — auth, OCR, PDF, expenses
-pytest test_improvements.py -v
-
-# Quick smoke test
-pytest test_smoke.py -v
+pytest                                   # SQLite, quick
+TEST_DATABASE_URL=postgresql://kts:kts@localhost:5432/kts_test pytest   # what CI runs
+ruff check .
 ```
+
+The concurrency tests (last-unit race, 50 parallel bills) only run on Postgres.
 
 ---
 
 ## API Reference
 
-### Authentication
+All routes except auth sign-in/refresh and health need `Authorization: Bearer <access_token>`.
+
+### Authentication & users
 ```
-POST /api/v1/auth/send-otp          Send OTP to phone number
-POST /api/v1/auth/verify-otp        Verify OTP, receive JWT token
+POST /api/v1/auth/firebase          Firebase phone ID token -> access + refresh tokens
+POST /api/v1/auth/refresh           Rotate refresh token
+POST /api/v1/auth/logout            Revoke this device's refresh token
+POST /api/v1/auth/logout-all        Revoke every session of the user
+GET  /api/v1/auth/me                Current user and business
+POST /api/v1/auth/set-pin           Set quick-unlock PIN
+POST /api/v1/auth/verify-pin        Check PIN (locks out after 5 wrong tries)
+PUT  /api/v1/auth/business          Business profile, invoice prefix, credit policy (owner)
+GET|POST /api/v1/users, PATCH /api/v1/users/{id}   Staff and roles (owner)
 ```
 
 ### Products
@@ -262,6 +197,8 @@ POST   /api/v1/purchases/scan       Upload invoice image for OCR extraction
 ```
 POST   /api/v1/bills                Create bill (auto GST, stock-out, credit check, ledger)
 GET    /api/v1/bills                 List bills
+GET    /api/v1/bills/{id}           Bill detail
+POST   /api/v1/bills/{id}/cancel    Cancel (reverses stock + ledger; number stays used)
 GET    /api/v1/bills/{id}/pdf       Download PDF invoice (?format=a4|thermal)
 GET    /api/v1/bills/{id}/share/whatsapp   Get WhatsApp share link
 ```
@@ -270,12 +207,14 @@ GET    /api/v1/bills/{id}/share/whatsapp   Get WhatsApp share link
 ```
 POST   /api/v1/payments             Record payment (auto ledger + outstanding update)
 GET    /api/v1/ledger/{type}/{id}   Party transaction history with running balance
-GET    /api/v1/outstanding           Receivable + payable + net summary
+GET    /api/v1/ledger/outstanding    Receivable + payable + net summary
 ```
 
 ### Inventory
 ```
-GET    /api/v1/inventory             Stock levels (filter: ?low_stock=true)
+GET    /api/v1/inventory             Stock levels at moving-average cost (?low_stock_only=true)
+GET    /api/v1/inventory/{id}/movements   Stock movement history
+POST   /api/v1/inventory/adjustments      Batch stock count / opening stock (owner, warehouse)
 ```
 
 ### Dashboard
@@ -303,6 +242,8 @@ kts-api/
 |   |-- main.py                    FastAPI app + CORS + router registration
 |   |-- config.py                  Pydantic Settings (JWT, Firebase, S3, DB)
 |   |-- database.py                SQLAlchemy engine + session factory
+|   |-- deps.py                    RequestContext + role checks (allow(...))
+|   |-- rate_limit.py              slowapi limiter (per user / per IP)
 |   |
 |   |-- models/
 |   |   |-- models.py              15 database tables (all UUIDs, timestamped)
@@ -313,14 +254,16 @@ kts-api/
 |   |   |-- transactions.py        Purchase, Bill, Payment, Expense, Ledger schemas
 |   |
 |   |-- services/
-|   |   |-- auth_service.py        JWT auth (create/decode token, get_current_user)
-|   |   |-- gst_engine.py          GST calculation (5 slabs x intra/inter-state)
+|   |   |-- auth_service.py        Access/refresh tokens, PIN hashing, Firebase verification
+|   |   |-- numbering.py           Financial-year invoice series (row-locked)
+|   |   |-- gst_engine.py          GST calculation, round-off, effective-dated HSN lookup
 |   |   |-- inventory_service.py   Stock in/out/wastage/adjustment + audit trail
 |   |   |-- ocr_service.py         Groq Vision OCR + PDF-to-image + product matching
 |   |   |-- bill_pdf.py            ReportLab PDF generator (A4 + 80mm thermal)
 |   |
 |   |-- routers/
-|   |   |-- auth.py                Phone OTP + JWT endpoints
+|   |   |-- auth.py                Firebase phone sign-in, refresh, PIN, business setup
+|   |   |-- users.py               Staff invites and roles (owner)
 |   |   |-- products.py            Product CRUD + search
 |   |   |-- parties.py             Customer + Company CRUD + search
 |   |   |-- purchases.py           Purchase creation + OCR scan
@@ -330,11 +273,12 @@ kts-api/
 |   |
 |   |-- utils/
 |       |-- unit_converter.py      Bag/Can/Case to Kg/L/Piece conversion
+|       |-- scoping.py             get_owned(): tenant-scoped lookup, 404 across tenants
 |
-|-- alembic/                       Database migrations
-|-- test_smoke.py                  Quick health checks
-|-- test_e2e.py                    Sprint 1 full-flow E2E tests
-|-- test_improvements.py           Sprint 2 feature tests (15 tests)
+|-- alembic/                       Database migrations (the only source of the schema)
+|-- tests/                         pytest suite (auth, tenancy, roles, billing, GST, migrations, concurrency)
+|-- data/hsn_rates.json            Effective-dated HSN -> GST rates
+|-- docs/                          Plans and operations runbook
 |-- requirements.txt               Python dependencies
 |-- .env.example                   Environment variable template
 |-- REMAINING_TASKS.md             Detailed breakdown of all remaining work
