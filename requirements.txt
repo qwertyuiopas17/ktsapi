@@ -1,6 +1,7 @@
 # === Core Framework ===
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
+gunicorn==23.0.0
 python-multipart==0.0.20
 python-dotenv==1.1.0
 
@@ -11,9 +12,10 @@ alembic==1.15.2
 
 # === Auth & Security ===
 firebase-admin==6.8.0
-python-jose[cryptography]==3.4.0
-passlib[bcrypt]==1.7.4
+PyJWT==2.10.1
 bcrypt==4.3.0
+slowapi==0.1.9
+redis==5.2.1
 
 # === Validation & Serialization ===
 pydantic[email]==2.11.5
@@ -23,6 +25,7 @@ pydantic-settings==2.9.1
 boto3==1.38.34
 
 # === PDF & OCR ===
+reportlab==4.4.1
 PyMuPDF==1.25.5
 Pillow==11.2.1
 google-cloud-documentai==3.6.0
@@ -30,3 +33,6 @@ google-cloud-documentai==3.6.0
 # === Utilities ===
 httpx==0.28.1
 python-dateutil==2.9.0
+
+# === Observability ===
+sentry-sdk[fastapi]==2.29.1

@@ -2,29 +2,26 @@
 KTS API — Database Setup
 SQLAlchemy engine, session factory, and base model.
 
-Connection priority (ported from Aethel):
-  1. DATABASE_URL env var (PostgreSQL in prod)
-  2. Fallback: SQLite for local dev
-
-Safety patterns applied from aethel-backend-v3:
-  - expire_on_commit=False for detached object safety
-  - check_same_thread=False for SQLite + FastAPI threadpool
-  - postgres:// → postgresql:// normalization for Render/Heroku
+The schema is owned by Alembic (`alembic upgrade head`); the app never calls
+`create_all` at startup.
 """
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
 from app.config import settings
 
-# Render/Heroku hand out "postgres://..." — SQLAlchemy 2.x
-# only accepts "postgresql://...". Normalise silently.
-_db_url = settings.DATABASE_URL
-if _db_url.startswith("postgres://"):
-    _db_url = _db_url.replace("postgres://", "postgresql://", 1)
 
+def normalize_db_url(url: str) -> str:
+    # Render/Heroku hand out "postgres://..."; SQLAlchemy 2.x only accepts "postgresql://".
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+_db_url = normalize_db_url(settings.DATABASE_URL)
 _is_sqlite = _db_url.startswith("sqlite")
 
-# Engine kwargs — SQLite needs check_same_thread=False for FastAPI
-_engine_kwargs: dict = {"pool_pre_ping": True, "echo": settings.APP_DEBUG}
+_engine_kwargs: dict = {"pool_pre_ping": True, "echo": settings.DB_ECHO}
 if _is_sqlite:
     _engine_kwargs["connect_args"] = {"check_same_thread": False}
 else:
@@ -33,20 +30,12 @@ else:
 
 engine = create_engine(_db_url, **_engine_kwargs)
 
-# expire_on_commit=False prevents DetachedInstanceError when
-# accessing attributes on objects after db.commit()
-# (ported from aethel-backend-v3/database.py)
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine,
-    expire_on_commit=False,
-)
+# expire_on_commit=False prevents DetachedInstanceError after commit
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
 
 
 class Base(DeclarativeBase):
     """Base class for all SQLAlchemy models."""
-    pass
 
 
 def get_db():
@@ -56,4 +45,3 @@ def get_db():
         yield db
     finally:
         db.close()
-

@@ -16,4 +16,3 @@ google-credentials.json
 Thumbs.db
 
 *.db
-alembic/versions/*.py
