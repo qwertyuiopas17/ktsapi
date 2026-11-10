@@ -139,6 +139,27 @@ ruff check .
 
 The concurrency tests (last-unit race, 50 parallel bills) only run on Postgres.
 
+### CI and Render staging
+
+GitHub Actions runs Ruff, the full test suite against PostgreSQL 16, and a Docker
+build for every pull request and push to `main`. Render waits for those checks
+before auto-deploying `main`; its pre-deploy command runs `alembic upgrade head`.
+
+1. In Render, create a Blueprint from this repository's `render.yaml`.
+2. Enter `CORS_ORIGINS` as a JSON array and provide the Firebase project ID.
+3. Add the Firebase service-account JSON as a Render **Secret File** at
+   `/etc/secrets/firebase-credentials.json`.
+4. Confirm `GET /health` succeeds after the first deploy. Add Sentry, S3, and
+   Groq secrets later as those integrations become available.
+
+The blueprint is a paid staging baseline (`starter` web service and
+`basic-256mb` Postgres) to avoid ephemeral free-tier infrastructure. It uses
+Singapore because Render does not currently offer Mumbai. If customer data must
+remain in India, deploy the same Docker image and release command with an
+India-region provider instead. `RATE_LIMIT_STORAGE_URI=memory://` is suitable
+only while staging runs one web-service instance; configure managed Redis before
+scaling horizontally.
+
 ---
 
 ## API Reference

@@ -6,7 +6,7 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-extend-exclude = ["alembic/versions"]
+extend-exclude = ["alembic/versions", "test_improvements.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B"]

@@ -11,13 +11,21 @@
 | Auth | Firebase project `kts-staging` | Firebase project `kts-prod` |
 
 Keep data in India: choose the Mumbai region for the database, the container
-host and the object storage bucket.
+host and the object storage bucket. Render does not currently provide a Mumbai
+region; the included staging blueprint uses Singapore and therefore does not meet
+a strict in-country residency requirement. Use an India-region provider when that
+requirement applies.
 
 ## Release steps
 
 1. CI is green on `main` (ruff + pytest against Postgres + Docker build).
 2. Run migrations as a one-off job: `alembic upgrade head`.
 3. Deploy the new image. The app never creates tables by itself.
+
+The Render blueprint enforces this order with `autoDeployTrigger: checksPass` and
+`preDeployCommand: alembic upgrade head`. Add the Firebase service-account JSON
+as a secret file at `/etc/secrets/firebase-credentials.json`; never store it in
+Git or as a plain environment variable.
 
 Required production settings: `APP_ENV=production`, a random 32+ character
 `JWT_SECRET_KEY`, `AUTH_DEV_STUB=false`, a Postgres `DATABASE_URL`, the Firebase

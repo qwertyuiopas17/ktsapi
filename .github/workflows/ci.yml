@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+
+  test:
+    name: Pytest (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: kts
+          POSTGRES_PASSWORD: kts
+          POSTGRES_DB: kts_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kts -d kts_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://kts:kts@localhost:5432/kts_test
+      DATABASE_URL: postgresql://kts:kts@localhost:5432/kts_test
+      APP_ENV: test
+      AUTH_DEV_STUB: "true"
+      RATE_LIMIT_ENABLED: "false"
+      JWT_SECRET_KEY: test-secret-key-that-is-long-enough-123456
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Verify migrations
+        run: alembic upgrade head
+      - name: Run tests
+        run: pytest
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: kts-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
